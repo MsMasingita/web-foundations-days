@@ -1,80 +1,66 @@
-// Variable to store the loaded users array
-let users = [];
+const USERS_URL = "https://jsonplaceholder.typicode.com/users";
 
-// Grab DOM elements
-const loadBtn = document.getElementById("load-users");
-const filterInput = document.getElementById("filter-input");
-const statusMsg = document.getElementById("status");
-const usersList = document.getElementById("users-list");
+const loadBtn = document.querySelector("#load-users");
+const filterInput = document.querySelector("#filter-input");
+const statusText = document.querySelector("#status");
+const list = document.querySelector("#users-list");
 
-// Step 3 & 4: Render function to draw users or show empty state
-function renderUsers(list) {
-  // Clear any existing list items first
-  usersList.textContent = "";
+let users = []; // filled once by loadUsers()
 
-  // Step 4 requirement: show fallback text if array is empty
-  if (list.length === 0) {
-    const emptyItem = document.createElement("li");
-    emptyItem.textContent = "No users match your filter.";
-    usersList.appendChild(emptyItem);
+function renderUsers(usersToShow) {
+  list.innerHTML = "";
+
+  if (usersToShow.length === 0) {
+    const li = document.createElement("li");
+    li.textContent = users.length
+      ? "No users match your filter."
+      : "No users loaded yet.";
+    list.appendChild(li);
     return;
   }
 
-  list.forEach((user) => {
+  usersToShow.forEach((user) => {
     const li = document.createElement("li");
 
-    const nameP = document.createElement("p");
-    nameP.textContent = `Name: ${user.name}`;
+    const name = document.createElement("strong");
+    name.textContent = user.name;
 
-    const emailP = document.createElement("p");
-    emailP.textContent = `Email: ${user.email}`;
+    const details = document.createElement("p");
+    details.textContent =
+      `${user.email} · ${user.address.city} · ${user.company.name}`;
 
-    const cityP = document.createElement("p");
-    cityP.textContent = `City: ${user.address ? user.address.city : "N/A"}`;
-
-    const companyP = document.createElement("p");
-    companyP.textContent = `Company: ${user.company ? user.company.name : "N/A"}`;
-
-    li.appendChild(nameP);
-    li.appendChild(emailP);
-    li.appendChild(cityP);
-    li.appendChild(companyP);
-
-    usersList.appendChild(li);
+    li.append(name, details);
+    list.appendChild(li);
   });
 }
 
-// Step 2: Fetch users function
 async function loadUsers() {
+  statusText.textContent = "Loading users...";
   loadBtn.disabled = true;
-  statusMsg.textContent = "Loading users...";
-  usersList.textContent = "";
 
   try {
-    const response = await fetch("https://jsonplaceholder.typicode.com/users");
-
+    const response = await fetch(USERS_URL);
     if (!response.ok) {
-      throw new Error(`Server error: ${response.status} ${response.statusText}`);
+      throw new Error(`Server responded with status ${response.status}`);
     }
-
     users = await response.json();
-    statusMsg.textContent = "Users loaded successfully!";
     renderUsers(users);
+    statusText.textContent = `Loaded ${users.length} users.`;
   } catch (error) {
-    statusMsg.textContent = `Error loading users: ${error.message}`;
+    console.error(error);
+    statusText.textContent = "Could not load users. Please try again.";
   } finally {
     loadBtn.disabled = false;
   }
 }
 
-// Attach event listeners
-loadBtn.addEventListener("click", loadUsers);
-
-// Step 4: Real-time case-insensitive filter
-filterInput.addEventListener("input", (event) => {
-  const searchTerm = event.target.value.toLowerCase().trim();
-  const filteredUsers = users.filter((user) =>
-    user.name.toLowerCase().includes(searchTerm)
+function applyFilter() {
+  const text = filterInput.value.trim().toLowerCase();
+  const matches = users.filter((user) =>
+    user.name.toLowerCase().includes(text)
   );
-  renderUsers(filteredUsers);
-});
+  renderUsers(matches);
+}
+
+loadBtn.addEventListener("click", loadUsers);
+filterInput.addEventListener("input", applyFilter);
