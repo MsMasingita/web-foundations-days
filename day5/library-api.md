@@ -43,4 +43,4 @@ All requests and responses use JSON.
 ## Errors
 
 - 400 Bad Request - the body is invalid, for example POST /books without a title, or "year" is text instead of a number.
-- 404 Not Found - the book does not exist, for example GET /books/99999.
+- 404 Not Found - the book does not exist, for example GET /books/99999
