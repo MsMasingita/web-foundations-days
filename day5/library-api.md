@@ -1,42 +1,46 @@
-# Library Books REST API Design
+# Library API - Books Resource
+
+Base URL: https://api.citylibrary.org/v1
+All requests and responses use JSON.
 
 ## Endpoints
 
-### 1. List All Books
+### List all books
 
-- **Method:** `GET`
-- **Path:** `/api/v1/books`
-- **Description:** Retrieves a list of all books in the library catalogue.
-- **Success Status Code:** `200 OK`
+- GET /books
+- Returns an array of books.
+- Success: 200 OK
 
-### 2. List Books by Author
+### Get one book
 
-- **Method:** `GET`
-- **Path:** `/api/v1/books?author={authorName}`
-- **Description:** Retrieves a list of books filtered by author name using a query parameter.
-- **Success Status Code:** `200 OK`
+- GET /books/{id}
+- Example: GET /books/15
+- Success: 200 OK
 
-### 3. Get One Book
+### Create a book
 
-- **Method:** `GET`
-- **Path:** `/api/v1/books/:id`
-- **Description:** Retrieves the details of a single book by its unique ID.
-- **Success Status Code:** `200 OK`
+- POST /books
+- Body: { "title": "Things Fall Apart", "author": "Chinua Achebe", "year": 1958, "copies": 3 }
+- Success: 201 Created (returns the new book with its id)
 
-### 4. Create a Book
+### Update a book
 
-- **Method:** `POST`
-- **Path:** `/api/v1/books`
-- **Description:** Adds a new book entry to the library catalogue.
-- **Success Status Code:** `201 Created`
-- **Request Body Example:**
+- PATCH /books/{id}
+- Body (only the fields to change): { "copies": 5 }
+- Success: 200 OK
 
-```json
-{
-  "title": "Things Fall Apart",
-  "author": "Chinua Achebe",
-  "publishedYear": 1958,
-  "isbn": "9780385474542",
-  "genre": "Fiction"
-}
-```
+### Delete a book
+
+- DELETE /books/{id}
+- Success: 204 No Content
+
+### List books by an author
+
+- GET /books?author=Chinua%20Achebe
+- Uses a query parameter to filter the list.
+- Success: 200 OK
+
+## Errors
+
+- 400 Bad Request - the body is invalid, for example POST /books without a title, or "year" is text instead of a number.
+- 404 Not Found - the book does not exist, for example GET /books/99999
