@@ -1,333 +1,131 @@
-# TicketHub System Design Document
+Set-Content -Path "day8/ticketing-design.md" -Value @'
+
+# TicketHub - System Design Document
 
 ## 1. Requirements
 
 ### Functional Requirements
 
-- Event Discovery: Users can browse, search, and filter upcoming concerts and events by date, venue, and genre[cite: 1, 2].
-- Seat Map & Availability: Users can view a live seating chart for a chosen event showing real-time seat states: available, held, or booked[cite: 1].
-- Seat Reservation (Hold): A user can select an available seat and temporarily hold it for 10 minutes while completing checkout[cite: 1].
-- Payment & Order Finalization: Users can submit payment for held seats before the hold expires to confirm the purchase[cite: 1].
-- Ticket Issuance: Once payment succeeds, the system generates an order and provides tickets with verifiable identifiers or QR codes[cite: 1].
+- Users can browse, search, and view details for available live events.
+- Real-time seat maps indicate which seats are open, held, or purchased.
+- Selected seats can be placed on a temporary 10-minute hold while checkout takes place.
+- Completing payment confirms the order and issues digital tickets that users can access under their profile.
 
 ### Non-Functional Requirements
 
-- Speed (Low Latency): Read operations (browsing events, viewing seat maps) must respond in under 100 ms under normal load and under 300 ms during traffic spikes[cite: 1].
-- Correctness (Zero Overbooking): Strict consistency must be guaranteed; under no circumstances may two customers purchase the same seat[cite: 1, 2].
-- Fairness: Seats are allocated on a first-come, first-served basis[cite: 1]. The system must prevent bot hoarding using rate limits and enforce a 10-minute maximum reservation lock[cite: 1].
-- Availability: Target 99.99% uptime for browsing, with graceful error handling so high write volume never crashes the read pipeline[cite: 1].
+- Correctness and Zero Overbooking: No single seat can ever be sold or assigned to more than one customer.
+- Scalability Under Spikes: The system must withstand short traffic surges reaching roughly 3,300 requests per second during major sales.
+- Low Latency: Standard catalog pages and searches must return responses in under 1 second during typical load.
+- Fair Allocation: A virtual waiting queue ensures users who arrive earlier get the first opportunity to pick seats and check out.
 
----
+## 2. Estimates
 
-## 2. Traffic & Capacity Estimations
-
-### Given Data Points
-
-- 2,000,000 registered users across the platform[cite: 1, 2].
-- Normal Day: 50,000 daily visitors viewing an average of 10 pages each, resulting in 5,000 tickets sold per day[cite: 1, 2].
-- Big Sale Peak: 200,000 active users attempt to purchase 20,000 seats within a 10-minute window[cite: 1, 2].
-
-### Normal Day Calculations
-
-- Total Daily Page Views: 50,000 \* 10 = 500,000 page views/day[cite: 1, 2].
-- Average Read Throughput: 500,000 / 86,400 = approximately 5.8 requests per second (RPS).
-- Peak Normal Read Throughput (assuming 80% of activity happens within an 8-hour window): 400,000 / 28,800 = approximately 13.9 RPS.
-- Write Throughput (Purchases): 5,000 / 86,400 = approximately 0.058 purchases per second[cite: 1, 2].
-
-### "Big Sale" Peak Calculations (10-Minute Window = 600 Seconds)
-
-- Write Throughput (Reservation / Hold Requests): 200,000 users attempt to reserve seats over 600 seconds, which equals 200,000 / 600 = approximately 333.3 write requests per second[cite: 1, 2]. Instantaneous bursts at opening second can spike above 5,000 writes/sec without queue throttling.
-- Read Throughput (Polling / Refreshing): Assuming each user refreshes the seat map or polls status every 3 seconds: 200,000 / 3 = approximately 66,667 read RPS.
-
-### Comparison: Normal Day vs. Big Sale
-
-- Read Traffic: Jumps from roughly 14 RPS to 66,667 RPS—an increase of more than 4,700 times normal peak load.
-- Write Traffic: Jumps from <0.1 transactions/sec to roughly 333 transactions/sec, all competing for the exact same database records (20,000 seats for one event)[cite: 1, 2].
-- Key Takeaway: A standard relational database cannot handle 66,000+ reads per second directly. We must use an edge CDN for static content, Redis caching for seat availability, and a virtual queue to buffer incoming reservation attempts.
-
----
+- Regular Daily Operations: 50,000 daily visitors viewing roughly 10 pages each generates 500,000 daily page requests (~5 requests per second).
+- Flash Sale Surge: 200,000 shoppers arriving across a 10-minute (600-second) window with ~10 interactions each yields ~2,000,000 total interactions, translating to roughly 3,300 requests per second.
+- Capacity Realities: The venue offers strictly 20,000 seats. Consequently, a maximum of 20,000 transactions will succeed; the remaining ~180,000 concurrent shoppers must receive immediate out-of-stock feedback without overwhelming core backend databases.
 
 ## 3. API Design
 
-### 1. Browse Events
+- GET /events?search=&city=
+  Returns a filtered collection of events (HTTP 200).
 
-- Method & Endpoint: GET /api/v1/events[cite: 1]
-- Description: Retrieves a paginated list of upcoming concerts and shows with filter parameters[cite: 1, 2].
-- Query Parameters: page (default 1), limit (default 20), search (keyword)
-- Response (200 OK):
-  {
-  "events": [
-  {
-  "id": "evt_101",
-  "title": "Acoustic Tour 2026",
-  "venue": "National Stadium",
-  "event_date": "2026-11-20T19:00:00Z",
-  "total_seats": 20000,
-  "available_seats": 15420
-  }
-  ],
-  "page": 1,
-  "total": 1
-  }
+- GET /events/{id}
+  Returns details, date, and venue metadata for a single event (HTTP 200).
 
-### 2. View Seats for an Event
+- GET /events/{id}/seats
+  Fetches current seating state (available, held, sold) for the venue chart (HTTP 200).
 
-- Method & Endpoint: GET /api/v1/events/:id/seats[cite: 1]
-- Description: Retrieves real-time seating availability for a specific venue and event[cite: 1].
-- Response (200 OK):
-  {
-  "event_id": "evt_101",
-  "seats": [
-  {
-  "seat_id": "seat_a10",
-  "section": "Stalls-Front",
-  "row": "A",
-  "number": 10,
-  "price_cents": 12000,
-  "status": "AVAILABLE"
-  }
-  ]
-  }
+- POST /holds
+  Request payload: { "eventId": 7, "seatIds": [101, 102] }
+  Success: HTTP 201 Created returning hold identifier and 10-minute expiration timestamp.
+  Conflict: HTTP 409 Conflict when one or more requested seats are already held or purchased.
 
-### 3. Hold a Seat (Temporary Reservation)
+- POST /orders
+  Request payload: { "holdId": 55, "paymentToken": "..." }
+  Success: HTTP 201 Created confirming the purchase and ticket issuance.
 
-- Method & Endpoint: POST /api/v1/seats/hold[cite: 1]
-- Description: Temporarily reserves a selected seat for 10 minutes so the customer can check out[cite: 1].
-- Request Body:
-  {
-  "event_id": "evt_101",
-  "seat_id": "seat_a10"
-  }
-- Response (200 OK - Seat Held):
-  {
-  "reservation_id": "res_8842",
-  "seat_id": "seat_a10",
-  "status": "HELD",
-  "expires_at": "2026-10-25T14:33:00Z"
-  }
-- Response (409 Conflict - Seat Taken):
-  {
-  "error": "SEAT_UNAVAILABLE",
-  "message": "This seat has already been selected or booked by someone else."
-  }
+- GET /me/tickets
+  Returns all verified tickets and admission passes belonging to the authenticated user (HTTP 200).
 
-### 4. Pay and Confirm Order
+An HTTP 409 Conflict status indicates the requested resource state has changed because another customer secured the seat hold first.
 
-- Method & Endpoint: POST /api/v1/orders/checkout[cite: 1]
-- Description: Validates payment token, clears the hold lock, and confirms seat purchase[cite: 1].
-- Request Body:
-  {
-  "reservation_id": "res_8842",
-  "payment_method_id": "pm_card_visa_4242"
-  }
-- Response (201 Created):
-  {
-  "order_id": "ord_9901",
-  "seat_id": "seat_a10",
-  "status": "CONFIRMED",
-  "amount_paid_cents": 12000,
-  "transaction_id": "txn_65412"
-  }
+## 4. Data Model
 
-### 5. View Purchased Tickets
+- users (id PK, name, email UNIQUE, password_hash)
+- events (id PK, name, venue, starts_at)
+- seats (id PK, event_id FK -> events, section, row, number, status ['available', 'held', 'sold'], hold_id, hold_expires_at, UNIQUE (event_id, section, row, number))
+- orders (id PK, user_id FK -> users, event_id FK -> events, total, status, created_at)
+- order_seats (order_id FK -> orders, seat_id FK -> seats UNIQUE)
 
-- Method & Endpoint: GET /api/v1/users/:id/tickets[cite: 1]
-- Description: Retrieves all confirmed tickets and verifiable passes issued to the user[cite: 1].
-- Response (200 OK):
-  {
-  "tickets": [
-  {
-  "ticket_id": "tkt_5021",
-  "order_id": "ord_9901",
-  "event_title": "Acoustic Tour 2026",
-  "section": "Stalls-Front",
-  "row": "A",
-  "seat_number": 10,
-  "qr_code_token": "qr_valid_882049"
-  }
-  ]
-  }
+Relationship Structure:
 
----
+- Each event includes multiple seats (one-to-many).
+- Each user can place multiple separate orders over time (one-to-many).
+- Each order can bundle multiple seats, but any given physical seat can only ever appear once across all orders thanks to the unique constraint on order_seats.seat_id.
 
-## 4. Data Model (Database Schema & Relationships)
+## 5. Preventing Double-Booking
 
-### Schema Definitions (SQL)
+To eliminate race conditions when multiple buyers click the same seat at once, the system uses an atomic conditional UPDATE executed directly within a database transaction:
 
--- 1. Users Table
-CREATE TABLE users (
-id VARCHAR(36) PRIMARY KEY,
-email VARCHAR(255) UNIQUE NOT NULL,
-full_name VARCHAR(120) NOT NULL,
-created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+    BEGIN TRANSACTION;
+    UPDATE seats
+    SET status = 'held',
+        hold_id = 55,
+        hold_expires_at = NOW() + INTERVAL '10 minutes'
+    WHERE id IN (101, 102)
+      AND event_id = 7
+      AND (status = 'available' OR (status = 'held' AND hold_expires_at < NOW()));
 
--- 2. Events Table
-CREATE TABLE events (
-id VARCHAR(36) PRIMARY KEY,
-title VARCHAR(200) NOT NULL,
-venue VARCHAR(200) NOT NULL,
-start_time TIMESTAMP WITH TIME ZONE NOT NULL,
-created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+    -- Evaluate affected row count:
+    -- If rows updated < requested seats, another buyer completed the hold first:
+    ROLLBACK; -- returns HTTP 409 Conflict
+    -- Otherwise, lock succeeds:
+    COMMIT;   -- returns HTTP 201 Created
 
--- 3. Seats Table
-CREATE TYPE seat_status AS ENUM ('AVAILABLE', 'HELD', 'BOOKED');
+Because the database engine checks availability and mutates status within a single atomic operation, concurrent attempts serialize at the row level; only the first attempt alters rows while the runner-up updates zero rows. The UNIQUE constraint on order_seats.seat_id acts as an immutable second layer preventing duplicate confirmed purchases. Expired holds automatically recycle back into availability since their hold_expires_at condition passes the WHERE filter.
 
-CREATE TABLE seats (
-id VARCHAR(36) PRIMARY KEY,
-event_id VARCHAR(36) NOT NULL REFERENCES events(id) ON DELETE CASCADE,
-section VARCHAR(50) NOT NULL,
-row_num VARCHAR(10) NOT NULL,
-seat_num VARCHAR(10) NOT NULL,
-price_cents INTEGER NOT NULL,
-status seat_status NOT NULL DEFAULT 'AVAILABLE',
-held_by_user_id VARCHAR(36) REFERENCES users(id),
-hold_expires_at TIMESTAMP WITH TIME ZONE,
-version INTEGER NOT NULL DEFAULT 0,
-CONSTRAINT unique_seat_per_event UNIQUE (event_id, section, row_num, seat_num)
-);
+## 6. Architecture
 
-CREATE INDEX idx_seats_event_status ON seats(event_id, status);
+    [ User Client Browsers ]
+               │
+               ▼
+    [ Content Delivery Network (CDN) ] ── (Static venue assets, event metadata)
+               │
+               ▼
+    [ Load Balancer ]
+               │
+               ▼
+    [ Virtual Waiting Room Queue ] ── (Regulates entry to ~2,000 active shoppers)
+               │
+               ▼
+    [ Stateless App Server Cluster ] (Horizontally autoscaled)
+         │                   │                     │
+         ▼                   ▼                     ▼
+    [ Redis Cache ]   [ Primary DB (PostgreSQL) ]  [ Payment Gateway ]
+     - Event details   - Holds, seat states, orders  (Third-party charge processing)
+     - Seat status map │
+       (Short TTL)     ▼
+                      [ Read Replicas ]
+                       - Browsing, search queries
+                       │
+                       ▼
+                      [ Message Queue (RabbitMQ / SQS) ]
+                       │
+                       ▼
+                      [ Background Workers ]
+                       - PDF generation, email dispatches
 
--- 4. Orders Table
-CREATE TYPE order_status AS ENUM ('PENDING', 'CONFIRMED', 'CANCELLED', 'REFUNDED');
+- CDN: Delivers static venue charts, images, and event pages directly from edge caches to eliminate repetitive server hits.
+- Virtual Waiting Room: Holds the bulk of peak traffic in an orderly FIFO queue, admitting batches of buyers at a controlled throughput to shield the write database.
+- Load Balancer & Autoscaling App Tier: Distributes web traffic evenly across stateless web workers that scale out automatically ahead of scheduled release events.
+- Redis Cache: Holds cached copies of seat availability for 2 to 5 seconds to absorb hundreds of thousands of read refreshes without taxing disk storage.
+- Primary Database: Exclusively handles transactional writes, seat holds, and confirmed sales under strict ACID consistency.
+- Read Replicas: Relieve the primary engine by handling high-volume read traffic like event browsing and ticket verification.
+- Async Worker Queue: Offloads non-critical post-payment steps (PDF rendering and confirmation emails) so user checkout finishes in milliseconds.
 
-CREATE TABLE orders (
-id VARCHAR(36) PRIMARY KEY,
-user_id VARCHAR(36) NOT NULL REFERENCES users(id),
-event_id VARCHAR(36) NOT NULL REFERENCES events(id),
-seat_id VARCHAR(36) NOT NULL REFERENCES seats(id),
-amount_cents INTEGER NOT NULL,
-status order_status NOT NULL DEFAULT 'PENDING',
-created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-CONSTRAINT unique_order_per_seat UNIQUE (seat_id)
-);
+## 7. Trade-offs
 
-### Table Relationships & Integrity
-
-- Users to Orders (1 : N): One user can make multiple purchases over time.
-- Events to Seats (1 : N): One event contains many individual seat records.
-- Events to Orders (1 : N): An event gathers many completed orders.
-- Seats to Orders (1 : 1): Each seat maps strictly to one confirmed order row via unique_order_per_seat, guaranteeing double-booking cannot persist at the database level[cite: 1, 2].
-
----
-
-## 5. Double-Booking Prevention (Transactions & Constraints)
-
-Double-booking happens when two buyers view an available seat at the same time and attempt to purchase it simultaneously[cite: 1]. The system uses a multi-layered approach to guarantee that no seat is sold twice[cite: 1, 2]:
-
-### 1. Database-Level Unique Constraints
-
-The schema enforces hard invariants directly at the database engine level:
-
-- In the seats table, CONSTRAINT unique_seat_per_event UNIQUE (event_id, section, row_num, seat_num) ensures no physical seat can be created twice.
-- In the orders table, CONSTRAINT unique_order_per_seat UNIQUE (seat_id) guarantees that even under race conditions, the database engine rejects duplicate purchases for the same seat.
-
-### 2. Atomic Conditional Updates (Optimistic Locking)
-
-Rather than locking the whole table, the application uses an atomic conditional UPDATE query when a user attempts to hold a seat:
-
-UPDATE seats
-SET status = 'HELD',
-held_by_user_id = :user_id,
-hold_expires_at = NOW() + INTERVAL '10 minutes',
-version = version + 1
-WHERE id = :seat_id
-AND (status = 'AVAILABLE' OR (status = 'HELD' AND hold_expires_at < NOW()))
-AND version = :current_version;
-
-- If two users attempt to reserve the same seat concurrently, the database serializes row-level locks.
-- The first transaction succeeds and increments the version.
-- The second transaction finds that version no longer matches (or status is no longer 'AVAILABLE'), updating 0 rows. The application detects this and immediately returns an HTTP 409 Conflict error.
-
-### 3. ACID Transactions for Payment and Final Order
-
-When payment is submitted, the checkout process executes within an atomic database transaction with READ COMMITTED or SERIALIZABLE isolation:
-
-BEGIN TRANSACTION;
-
--- 1. Ensure the user holding the seat is the one paying, and hold has not expired
-SELECT id FROM seats
-WHERE id = :seat_id
-AND held_by_user_id = :user_id
-AND hold_expires_at > NOW()
-FOR UPDATE;
-
--- 2. Mark seat as permanently booked
-UPDATE seats
-SET status = 'BOOKED',
-held_by_user_id = NULL,
-hold_expires_at = NULL,
-version = version + 1
-WHERE id = :seat_id;
-
--- 3. Create the confirmed order
-INSERT INTO orders (id, user_id, event_id, seat_id, amount_cents, status)
-VALUES (:order_id, :user_id, :event_id, :seat_id, :amount_cents, 'CONFIRMED');
-
-COMMIT;
-
-If the hold expired or payment failed, the entire transaction is rolled back, preventing orphaned charges or unassigned tickets.
-
----
-
-## 6. Architecture & Peak Sale Survival
-
-### Architecture Diagram
-
-[ 200,000 Users / Mobile & Web Browsers ]
-|
-v
-[ Cloudflare CDN ] <-- Caches static assets & event details
-|
-v
-[ Virtual Waiting Room / Queue ] <-- Throttles ingress to 500 req/sec
-|
-v
-[ Application Load Balancers ]
-|
-+-----------+-----------+
-| |
-v v
-[ App Server 1 ] [ App Server 2 ] ... [ App Server N ] (Autoscaling)
-| |
-+-----------------------+-----------------------+
-| |
-v v
-[ Redis In-Memory Cluster ] [ PostgreSQL Primary ]
-
-- Fast hold locks (SET NX EX) - Row-level ACID transactions
-- Cached seat availability map - Final order placement
-- Queue token validation |
-  v
-  [ PostgreSQL Replicas ] - Read-only queries (user tickets)
-
-### How the Architecture Survives the Big Sale
-
-1. Edge Caching via CDN:
-   The Content Delivery Network caches static frontend assets and immutable event metadata at edge locations. This absorbs over 90% of general page browsing without those requests ever reaching the core backend servers.
-
-2. Virtual Waiting Room (Traffic Throttling):
-   Instead of letting all 200,000 concurrent users hit the reservation database directly, incoming traffic is routed into a FIFO queue. The queue admits users in controlled batches (e.g., 500 users per second), protecting downstream services from collapsing.
-
-3. In-Memory Locks with Redis:
-   When a user clicks to hold a seat, the application attempts an atomic lock operation in Redis using SET lock:seat:{seat_id} {user_id} NX EX 600. Because Redis operates in memory with sub-millisecond latencies, it can handle tens of thousands of lock acquisition attempts per second, instantly rejecting duplicate attempts before they touch the relational database.
-
-4. Horizontally Scaled Application Cluster:
-   Stateless application instances scale out automatically behind the load balancer based on CPU utilization and request queues, ensuring computing capacity dynamically matches user volume.
-
-5. Read/Write Splitting on the Database:
-   The primary PostgreSQL instance is dedicated exclusively to processing write transactions (seat holds, state transitions, and confirmed orders). Read queries (such as checking order history or browsing seat maps) are served by read replicas and cached Redis keys.
-
----
-
-## 7. Architectural Trade-offs
-
-1. In-Memory Distributed Locking (Redis) vs. Pure Relational Database Locking (SELECT ... FOR UPDATE)
-   - Chosen Approach: We place an in-memory Redis lock in front of the primary relational database to intercept rapid reservation attempts.
-   - Trade-off: This introduces additional architectural complexity and requires keeping the cache and the database synchronized. However, relying solely on pessimistic row locks (FOR UPDATE) in PostgreSQL under a 200,000-user spike would saturate the database connection pool, cause widespread transaction deadlocks, and take down the entire system[cite: 1, 2].
-
-2. Virtual Waiting Room (Queuing) vs. Immediate Direct Access
-   - Chosen Approach: Users are held in a virtual queue and released into the seat checkout funnel in calibrated batches (e.g., 500 users per second).
-   - Trade-off: Users do not get instant real-time checkout access and must wait a few minutes in a queue, which can add minor friction to the user experience. However, this trade-off is necessary to protect the application from cascading failures, crash prevention, and automated bot scraping.
+1. Consistency over Availability for Seat Purchases: All hold operations and orders are strictly routed to the primary relational database. If heavy contention delays a query, returning an error or delay is preferable to eventual consistency, which could trigger catastrophic duplicate ticket sales.
+2. Caching Latency vs. Read Performance: Caching seat maps with a short time-to-live (TTL) means buyers might occasionally click a seat that was taken seconds prior. The backend catches this instantly during the hold transaction and issues an HTTP 409 Conflict, a trade-off that successfully protects the primary database from crashing under 3,300 RPS.
+3. Queue Overhead vs. Direct Access: Introducing a virtual waiting room adds architectural moving parts and obligates shoppers to wait in line, but it stops automated bots from hoarding inventory and prevents traffic spikes from bringing down the application.
+   '@
